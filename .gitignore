@@ -1,0 +1,8 @@
+node_modules
+dist
+.env.*
+
+# Firebase service-account credentials
+src/config/*firebase-adminsdk*.json
+src/config/*service-account*.json
+src/config/*.credentials.json
