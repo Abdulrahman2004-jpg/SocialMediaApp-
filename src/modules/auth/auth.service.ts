@@ -1,0 +1,334 @@
+import AuthenticationService from '../../shared/services/authentication.service';
+import { NextFunction, Request, Response } from "express";
+import { AppError } from '../../shared/utils/global.error.handler';
+import * as configService from "../../config/config.service";
+import { v4 as uuidv4 } from 'uuid';
+import userRepository from '../../database/repositories/user.repository';
+import { Compare, Hash } from '../../shared/utils/security/hash.security';
+import { encrypt } from '../../shared/utils/security/encrypt.security';
+import { generateOTP, sendEmail } from '../../shared/utils/email/send.email';
+import { emailTemplate } from '../../shared/utils/email/email.template';
+import { eventEmitter } from '../../shared/utils/email/email.events';
+import { EventEnum } from '../../shared/enums/event.enum';
+import { success_response } from '../../shared/utils/successRes';
+import RedisService from '../../shared/services/redis.service';
+import { ProviderEnum, RoleEnum } from '../../shared/enums/user.enum';
+import { OAuth2Client, TokenPayload } from 'google-auth-library';
+import notificationService from '../../shared/services/notification.service';
+import { Types } from 'mongoose';
+import { signUpSchema_graphQlDTO, updateUserSchema_graphQlDTO } from './auth.dto';
+
+class AuthService {
+
+    private readonly _userModel = new userRepository();
+    private readonly _redisService = RedisService;
+    private readonly _authenticationService = AuthenticationService;
+    private readonly _notificationService = notificationService;
+
+    sendEmailOTP = async ({ email, subject }: { email: string, subject: string }) => {
+        const otpBlocked = await this._redisService.ttl(this._redisService.blocked_otp({ email }));
+        if (otpBlocked && otpBlocked > 0) {
+            throw new Error(`you are bloked now , resend otp after ${otpBlocked} seconds `);
+        }
+
+        const otpTTL = await this._redisService.ttl(this._redisService.otp_key({ email }));
+        if (otpTTL && otpTTL > 0) {
+            throw new Error(`you can resend otp after ${otpTTL} seconds `);
+        }
+
+        const maxOTP = await this._redisService.get(this._redisService.max_tries_otp({ email }));
+        if (maxOTP >= 3) {
+            await this._redisService.set({ key: this._redisService.blocked_otp({ email }), value: 1, ttl: 60 })
+            throw new Error(`you have exceeded the maximum nuber of tries`);
+        }
+
+        const OTP = await generateOTP();
+
+        eventEmitter.emit(EventEnum.confirmEmail, async () => {
+            await sendEmail({
+                to: email,
+                subject: "Welcome to ConnectHub - verify your account",
+                html: emailTemplate(OTP),
+            });
+
+            await this._redisService.incr(this._redisService.max_tries_otp({ email }))
+
+            await this._redisService.set({
+                key: this._redisService.otp_key({ email, subject }),
+                value: Hash({ plainText: String(OTP), saltRounds: 12 }),
+                ttl: 60, //1m
+            });
+        })
+    }
+
+    signUp = async (req: Request, res: Response, next: NextFunction) => {
+        const { userName, email, password, age, phone, gender } = req.body
+
+        if (await this._userModel.checkUser(email)) {
+            throw new AppError("email already exist", 400)
+        }
+
+        const otp = await generateOTP();
+        eventEmitter.emit(EventEnum.confirmEmail, async () => {
+                await sendEmail({
+                    to: email,
+                    subject: "Welcome to ConnectHub - verify your account",
+                    html: emailTemplate(otp)
+                })
+            })
+
+            await this._redisService.set({
+                key: this._redisService.otp_key({ email, subject: EventEnum.confirmEmail }),
+                value: Hash({ plainText: String(otp), saltRounds: 12 }),
+                ttl: 60 * 5, //5m
+            });
+
+            await this._redisService.set({
+                key: this._redisService.max_tries_otp({ email }),
+                value: 1,
+                ttl: 60 * 5 * 3,
+            })
+
+            const user = await this._userModel.create({
+                userName,
+                email,
+                password: Hash({ plainText: password }),
+                age,
+                phone: encrypt(phone),
+                gender
+            });
+
+            res.status(200).json({ message: "user signup successful", user })
+        
+    }
+
+    signIn = async (req: Request, res: Response, next: NextFunction) => {
+        const { email, password, fcm } = req.body
+        const user = await this._userModel.findOne({
+            filter: {
+                email,
+                confirmed:true
+            }
+        });
+        if (!user || !Compare({ plainText: String(password), cipherText: String(user.password) })) {
+            throw new AppError("invalid confirmed email or password", 400)
+        }
+
+        const randomID = uuidv4();
+
+        const accessToken = this._authenticationService.generateToken({
+            payload: { id: user.id },
+            secretOrPrivateKey: user.role == RoleEnum.USER ? configService.ACCESS_SECRET_KEY_USER! : configService.ACCESS_SECRET_KEY_ADMIN!,
+            options: {
+                expiresIn: "2h",
+                jwtid: randomID
+            }
+        })
+
+        const refreshToken = this._authenticationService.generateToken({
+            payload: { id: user.id },
+            secretOrPrivateKey: user.role == RoleEnum.USER ? configService.REFRESH_SECRET_KEY_USER! : configService.ACCESS_SECRET_KEY_ADMIN!,
+            options: {
+                expiresIn: "30d",
+                jwtid: randomID
+            }
+        })
+
+        if (fcm) {
+            await this._redisService.addFCM(user._id, fcm)
+            const tokens = await this._redisService.getFCMs(user._id)
+            // if user logged in from more than one device
+            await this._notificationService.sendNotifications({
+                userId: user._id,
+                tokens,
+                data: {
+                    title: `Welcome back ${user.firstName}`,
+                    body: "Welcome to ConnectHub. Please complete the verification process."
+                }
+            })
+        }
+        res.status(200).json({ message: "user signin successful", data: { accessToken, refreshToken } })
+    }
+
+    confirmEmail = async (req: Request, res: Response) => {
+        const { email, code } = req.body;
+
+        const otpValue = await this._redisService.get(this._redisService.otp_key({ email }));
+
+        if (!otpValue) {
+            throw new Error("otp expired");
+        }
+
+        if (!Compare({ plainText: code, cipherText: otpValue })) {
+            throw new Error(" invalid otp ");
+        }
+
+        const user = await this._userModel.findOneAndUpdate({
+            filter: {
+                email,
+                confirmed: { $ne: true },
+            },
+            updateData: { confirmed: true },
+        });
+
+        if (!user) {
+            throw new Error(" user not exist ");
+        }
+
+        await this._redisService.del(this._redisService.otp_key({ email }));
+        success_response({ res, message: "email confirmed successfully" });
+    };
+
+    resendEmail = async (req: Request, res: Response) => {
+        const { email } = req.body;
+
+        const user = await this._userModel.findOne({
+            filter: {
+                email,
+                confirmed: { $ne: true },
+                provider: ProviderEnum.LOCAL,
+            },
+        });
+
+        if (!user) {
+            throw new Error(" user not exist or already confirmed ");
+        }
+
+        await this.sendEmailOTP({ email, subject: EventEnum.confirmEmail })
+
+        success_response({ res, message: "otp sent successfully" });
+    };
+
+    signUpWithGmail = async (req: Request, res: Response) => {
+        const { idToken } = req.body;
+
+        console.log("Body received:", req.body);
+        const client = new OAuth2Client();
+        const ticket = await client.verifyIdToken({
+            idToken,
+            audience:
+                "746397644004-0lrjg9attdmq6bfpeo5nmcpfjij20s0m.apps.googleusercontent.com",
+        });
+        const payload = ticket.getPayload();
+        const { email, name, picture, email_verified } = payload as TokenPayload;
+
+        let user = await this._userModel.findOne({ filter: { email } });
+
+        if (!user) {
+            user = await this._userModel.create({
+                email: email!,
+                userName: name!,
+                confirmed: email_verified!,
+                provider: ProviderEnum.GOOGLE!,
+            });
+        }
+
+        if (user && user.provider == ProviderEnum.LOCAL) {
+            throw new Error("please logIn using the system form");
+        }
+
+        const access_token = this._authenticationService.generateToken(
+            {
+                payload: {
+                    id: user._id,
+                    email: user.email,
+                },
+                secretOrPrivateKey: configService.ACCESS_SECRET_KEY_USER!,
+
+                options: {
+                    expiresIn: "1day",
+                },
+            },
+        );
+        success_response({
+            res,
+            message: "logged in successfully",
+            data: { access_token },
+        });
+    };
+
+
+    // ================ graphql ================
+    updateUserProfile = async(user:any, updatedData:updateUserSchema_graphQlDTO)=>{
+        const { firstName, lastName, email, age, phone, gender } = updatedData 
+        const updatedUser = await this._userModel.findByIdAndUpdate({
+            id:user._id,
+            updateData:{
+                firstName:firstName?firstName:user.firstName, 
+                lastName:lastName?lastName:user.lastName, 
+                email:email?email:user.email, 
+                age:age?age:user.age, 
+                phone:phone?encrypt(phone as string):user.phone, 
+                gender:gender?gender:user.gender, 
+            }
+        })
+        console.log(updatedUser);
+        
+        return updatedUser
+    }
+    
+    deleteUserProfile = async(_id:Types.ObjectId)=>{
+        const deletedUser = await this._userModel.findOneAndDelete({filter:{_id}})
+        
+        return deletedUser
+    }
+
+    getUsers = async () => {
+        const users = await this._userModel.find({filter:{}})
+        if (users.length==0) {
+            throw new AppError("no users found");
+        }
+        return users
+    }
+
+    getUserById = async (_id:Types.ObjectId) => {
+        const user = await this._userModel.findOne({filter:{_id}})
+        if (!user) {
+            throw new AppError("user not exist");
+        }
+        return user
+    }
+
+    signUp_graphQl = async (args:signUpSchema_graphQlDTO) => {
+        const { userName, email, password, age, phone, gender } = args 
+
+        if (await this._userModel.checkUser(email)) {
+            throw new AppError("email already exist", 400)
+        }
+
+        const otp = await generateOTP();
+        eventEmitter.emit(EventEnum.confirmEmail, async () => {
+            await sendEmail({
+                to: email,
+                subject: "Welcome to ConnectHub - verify your account",
+                html: emailTemplate(otp)
+            })
+        })
+
+            await this._redisService.set({
+                key: this._redisService.otp_key({ email, subject: EventEnum.confirmEmail }),
+                value: Hash({ plainText: String(otp), saltRounds: 12 }),
+                ttl: 60 * 5, //5m
+            });
+
+            await this._redisService.set({
+                key: this._redisService.max_tries_otp({ email }),
+                value: 1,
+                ttl: 60 * 5 * 3,
+            })
+
+            const user = await this._userModel.create({
+                userName,
+                email,
+                password: Hash({ plainText: password }),
+                age,
+                phone: encrypt(phone as string),
+                gender
+            });
+        
+        
+        return user
+    }
+}
+
+export default new AuthService()
